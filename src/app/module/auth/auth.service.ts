@@ -2,6 +2,7 @@
 import bcrypt from "bcryptjs";
 import type { TokenPayload } from "google-auth-library";
 import type { JwtPayload, SignOptions } from "jsonwebtoken";
+import crypto from "crypto"
 import {
 	AuthProvider,
 	Role,
@@ -12,14 +13,18 @@ import { googleClient } from "../../lib/googleAuth";
 import { prisma } from "../../lib/prisma";
 import { jwtUtils } from "../../utils/jwt";
 import type {
+	IForgotPasswordPayload,
 	IGoogleLoginPayload,
 	ILoginUserPayload,
 	IRegisterPatientPayload,
 	IRequestUser,
+	IResetPasswordPayload,
 } from "./auth.interface";
+import { redisClient } from "../../lib/redis";
 
 const registerPatient = async (payload: IRegisterPatientPayload) => {
-	const { name, password } = payload;
+	const { name, password, patient : patientData } = payload;
+	
 	const email = payload.email.trim().toLowerCase();
 
 	const isUserExists = await prisma.user.findUnique({
@@ -41,7 +46,7 @@ const registerPatient = async (payload: IRegisterPatientPayload) => {
 			status: UserStatus.ACTIVE,
 			emailVerified: false,
 			patient: {
-				create: { name, email },
+				create: { name, email, contactNumber : patientData?.contactNumber || "" },
 			},
 		},
 		omit: { password: true },
@@ -332,10 +337,56 @@ const googleLogin = async (payload: IGoogleLoginPayload) => {
 	};
 };
 
+const forgotPassword = async(payload: IForgotPasswordPayload)=>{
+	const {email} = payload;
+
+	const isUserExists = await prisma.user.findUnique({
+		where: {
+			email
+		}
+	})
+
+	if(!isUserExists){
+		throw new Error("User doesn't Exists");
+	}
+
+	if(isUserExists.status === "BLOCKED"){
+		throw new Error("User is blocked");
+	}
+
+	if(!isUserExists.emailVerified){
+		throw new Error("User not verified")
+	}
+
+	if(isUserExists.isDeleted || isUserExists.status === "DELETED"){
+		throw new Error("User is deleted");
+	}
+
+	if(isUserExists.googleId && isUserExists.authProvider === "GOOGLE"){
+		throw new Error("User has account with google")
+	}
+
+	const otp = crypto.randomInt(100000, 1000000).toString()
+
+	const key = `forgot-password-otp:${isUserExists.email}`
+
+	await redisClient.set(key, otp, {
+		expiration: {
+			type: "EX",
+			value: 5 * 60
+		}
+	})
+
+}
+
+const resetPassword = async(payload: IResetPasswordPayload)=>{}
+
 export const AuthService = {
 	registerPatient,
 	loginUser,
 	getMe,
 	refreshToken,
 	googleLogin,
+	forgotPassword,
+	resetPassword
 };
