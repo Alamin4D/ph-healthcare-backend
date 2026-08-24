@@ -7,7 +7,6 @@ export const ApplyAsDoctorValidationZodSchema = z.object({
 		email: z.email("Invalid email address").trim().toLowerCase(),
 	}),
 
-	
 	doctor: z.object({
 		address: z
 			.string()
