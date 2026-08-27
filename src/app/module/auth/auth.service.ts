@@ -11,6 +11,7 @@ import {
 	UserStatus,
 } from "../../../generated/prisma/enums";
 import config from "../../config";
+import httpStatus from "http-status"
 import { googleClient } from "../../lib/googleAuth";
 import { transporter } from "../../lib/nodemailer";
 import { prisma } from "../../lib/prisma";
@@ -25,6 +26,7 @@ import type {
 	IResetPasswordPayload,
 	IVerifyEmailPayload,
 } from "./auth.interface";
+import { AppError } from "../../utils/AppError";
 
 const registerPatient = async (payload: IRegisterPatientPayload) => {
 	const { name, password, patient : patientData } = payload;
@@ -217,7 +219,7 @@ const loginUser = async (payload: ILoginUserPayload) => {
 	});
 
 	if (!user) {
-		throw new Error("User not found");
+		throw new AppError(httpStatus.NOT_FOUND, "User not found");
 	}
 
 	if (user.status === UserStatus.BLOCKED) {
