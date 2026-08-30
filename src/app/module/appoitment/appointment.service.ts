@@ -1,26 +1,117 @@
 import {
 	AppointmentStatus,
 	PaymentStatus,
+	ScheduleStatus,
 } from "../../../generated/prisma/enums";
+import PDFDocument from "pdfkit";
 import config from "../../config";
 import { getBkashIdToken } from "../../lib/bkash";
 import { prisma } from "../../lib/prisma";
 import type { RequestUser } from "../../middleware/checkAuth";
+import { AppError } from "../../utils/AppError";
+import httpStatus from "http-status";
+import { IBookAppointmentPayload, IPayAppointmentPayload } from "./appointment.interface";
+import { addMinutes, isBefore, isSameDay } from "date-fns";
+import { transporter } from "../../lib/nodemailer";
 
-const bookAppointment = async (payload: any, user: RequestUser) => {
+
+const bookAppointment = async (payload: IBookAppointmentPayload , user: RequestUser) => {
 	const transactionResult = await prisma.$transaction(async (tx) => {
 		// business logic
+
+		const patient = await prisma.patient.findUnique({
+			where: { userId: user.userId },
+		});
+
+		if (!patient) {
+			throw new AppError(httpStatus.NOT_FOUND, "Patient Profile Not Found");
+		}
+
+		const schedule = await prisma.schedule.findUnique({
+			where: { id: payload.scheduleId },
+			include: { doctor: true },
+		});
+
+		if (!schedule || schedule.isDeleted) {
+			throw new AppError(httpStatus.NOT_FOUND, "Schedule Not Found");
+		}
+
+		if (schedule.status !== ScheduleStatus.PUBLISHED) {
+			throw new AppError(
+				httpStatus.BAD_REQUEST,
+				"This Schedule Is Not Published Yet",
+			);
+		}
+
+		const now = new Date()
+
+		if(!isSameDay(now, schedule.startDateTime)){
+			throw new AppError(
+				httpStatus.BAD_REQUEST,
+				"This Schedule Is Not Available Today",
+			);
+		}
+
+		if(!isBefore(now, schedule.startDateTime)){
+			throw new AppError(
+				httpStatus.BAD_REQUEST,
+				"This Schedule Has Already Started",
+			);
+		}
+		// if(isAfter(now, schedule.startDateTime)){
+		// 	throw new AppError(
+		// 		httpStatus.BAD_REQUEST,
+		// 		"This Schedule Has Already Started",
+		// 	);
+		// }
+
+		const existingAppointment = await prisma.appointment.findFirst({
+			where : {
+				patientId : patient.id,
+				scheduleId : schedule.id,
+				// status : { not : AppointmentStatus.CANCELLED }
+			}
+		})
+
+		if(existingAppointment?.status === AppointmentStatus.PENDING){
+			throw new AppError(httpStatus.BAD_REQUEST, "You Already Have A Pending Appointment. Please Pay For That")
+		}
+		if(existingAppointment?.status === AppointmentStatus.CONFIRMED){
+			throw new AppError(httpStatus.BAD_REQUEST, "You Already Have A Confirmed Appointment.")
+		}
+		if(existingAppointment?.status === AppointmentStatus.ONGOING){
+			throw new AppError(httpStatus.BAD_REQUEST, "You Already Have A Ongoing Appointment")
+		}
+		if(existingAppointment?.status === AppointmentStatus.COMPLETED){
+			throw new AppError(httpStatus.BAD_REQUEST, "You Already Have Completed An Appointment On This Schedule. Please Try Again Another Day")
+		}
+
+		if(schedule.availableSlots === 0){
+			throw new AppError(httpStatus.BAD_REQUEST, "This Schedule Is Fully Booked");
+		}
+
+		if(!schedule.doctor.consultationFee){
+			throw new AppError(
+				httpStatus.BAD_REQUEST,
+				"Doctor Has Not Set A Consultation Fee Yet",
+			);
+		}
+
+		const amount = schedule.doctor.consultationFee.toString();
 
 		const appointment = await tx.appointment.create({
 			data: {
 				status: AppointmentStatus.PENDING,
+				patientId : patient.id,
+				doctorId : schedule.doctor.id,
+				scheduleId : schedule.id
 			},
 		});
 
 		const bkashIdToken = await getBkashIdToken();
 
 		if (!bkashIdToken) {
-			throw new Error("No Bkash Access Token Found!");
+			throw new AppError(httpStatus.BAD_GATEWAY, "No Bkash Access Token Found!");
 		}
 
 		const bkashCreatePaymentResponse = await fetch(
@@ -38,7 +129,7 @@ const bookAppointment = async (payload: any, user: RequestUser) => {
 					// payerReference: "0123456789", //user email or phone number
 					payerReference: user.email, //user email or phone number
 					callbackURL: `${config.bkash_callback_url}/appointment/book-appointment/payment/callback`,
-					amount: "1200",
+					amount: amount,
 					currency: "BDT",
 					intent: "sale",
 					// merchantInvoiceNumber: "Inv4" // apppointment id
@@ -55,7 +146,7 @@ const bookAppointment = async (payload: any, user: RequestUser) => {
 			data: {
 				merchantInvoiceNumber: bkashCreatePaymentResult.merchantInvoiceNumber,
 				appointmentId: appointment.id,
-				amount: "1200",
+				amount: amount,
 				gatewayResponse: bkashCreatePaymentResult,
 				bkashPaymentId: bkashCreatePaymentResult.paymentID,
 				payerReference: user.email,
@@ -70,21 +161,28 @@ const bookAppointment = async (payload: any, user: RequestUser) => {
 	return transactionResult;
 };
 
-const payAppointment = async (payload: any, user: RequestUser) => {
+const payAppointment = async (payload: IPayAppointmentPayload, user: RequestUser) => {
 	const appointmentId = payload.appointmentId;
 
 	const existingAppointment = await prisma.appointment.findUnique({
 		where: {
 			id: appointmentId,
 		},
+		include : {
+			schedule : {
+				include : {
+					doctor : true
+				}
+			}
+		}
 	});
 
 	if (!existingAppointment) {
-		throw new Error("Appointment Does Not Exists");
+		throw new AppError(httpStatus.NOT_FOUND, "Appointment Does Not Exists");
 	}
 
 	if (existingAppointment.status !== "PENDING") {
-		throw new Error("Appointment Is Not Pending!");
+		throw new AppError(httpStatus.BAD_REQUEST, "Appointment Is Not Pending!");
 	}
 
 	// if (existingAppointment.status === "CANCELLED" || existingAppointment.status === "ONGOING" || existingAppointment.status === "COMPLETED"){
@@ -92,10 +190,19 @@ const payAppointment = async (payload: any, user: RequestUser) => {
 	//     throw new Error(`Appointment is already ${appointmentStatus.toLowerCase}`)
 	// }
 
+	if (!existingAppointment.schedule.doctor.consultationFee){
+		throw new AppError(
+			httpStatus.BAD_REQUEST,
+			"Doctor Has Not Set A Consultation Fee Yet",
+		);
+	}
+
+
+	const amount = existingAppointment.schedule.doctor.consultationFee.toString();
 	const bkashIdToken = await getBkashIdToken();
 
 	if (!bkashIdToken) {
-		throw new Error("No Bkash Access Token Found!");
+		throw new AppError(httpStatus.BAD_GATEWAY, "No Bkash Access Token Found!");
 	}
 
 	const bkashCreatePaymentResponse = await fetch(
@@ -113,7 +220,7 @@ const payAppointment = async (payload: any, user: RequestUser) => {
 				// payerReference: "0123456789", //user email or phone number
 				payerReference: user.email, //user email or phone number
 				callbackURL: `${config.bkash_callback_url}/appointment/book-appointment/payment/callback`,
-				amount: "1200",
+				amount: amount,
 				currency: "BDT",
 				intent: "sale",
 				// merchantInvoiceNumber: "Inv4" // apppointment id
@@ -146,19 +253,19 @@ const bookAppointmentCallback = async (query: Record<string, any>) => {
 		const paymentId = query.paymentID;
 
 		if (!paymentId) {
-			throw new Error("Payment Id Missing");
+			throw new AppError(httpStatus.BAD_REQUEST, "Payment Id Missing");
 		}
 
 		const status = query.status;
 
 		if (!status) {
-			throw new Error("Payment Status is Missing");
+			throw new AppError(httpStatus.BAD_REQUEST, "Payment Status is Missing");
 		}
 
 		const bkashIdToken = await getBkashIdToken();
 
 		if (!bkashIdToken) {
-			throw new Error("No Bkash Access Token Found!");
+			throw new AppError(httpStatus.BAD_GATEWAY, "No Bkash Access Token Found!");
 		}
 
 		const executedPaymentResponse = await fetch(
@@ -181,14 +288,71 @@ const bookAppointmentCallback = async (query: Record<string, any>) => {
 		const executedPaymentResult = await executedPaymentResponse.json();
 
 		if (status === "success") {
+
+			const appointment = await prisma.appointment.findUnique({
+				where : {
+					id: executedPaymentResult.merchantInvoiceNumber
+				},
+				include : {
+					schedule : true,
+					patient : true,
+					doctor : true
+				}
+			});
+
+			if(!appointment){
+				throw new AppError(httpStatus.NOT_FOUND, "Appointment Not Found!")
+			}
+
+
+
+			
+
+			// total slot = 3 , available slot = 2
+			// (total - available) + 1
+
+			const alreadyBookedSlots = appointment.schedule.totalSlots - appointment.schedule.availableSlots;
+
+			const serialNumber = alreadyBookedSlots + 1
+
+			// 25 August => 3:00 PM - 4:00 PM
+			// 1st person joining time => startDateTime = 2026-08-25T15:00:00.436Z => 3:00 PM
+			// serial number (1) - 1 * 20 => 0 minues
+
+			// 2nd person joining time => startDateTime = 2026-08-25T15:20:00.436Z => 3:00 PM
+			// serial number (2) - 1 * 20 => 20 minutes
+
+
+			// 3nd person joining time => startDateTime = 2026-08-25T15:40:00.436Z => 3:00 PM
+			// serial number (3) - 1 * 20 => 40 mintes
+
+			const joiningTime = addMinutes(
+				appointment.schedule.startDateTime, 
+				(serialNumber - 1) * 20
+			)
+
 			await tx.appointment.update({
 				where: {
 					id: executedPaymentResult.merchantInvoiceNumber,
+					
 				},
 				data: {
 					status: AppointmentStatus.CONFIRMED,
+					joiningTime,
+					serialNumber
 				},
 			});
+
+			const newAvailableSlots = appointment.schedule.availableSlots - 1;
+
+			await prisma.schedule.update({
+				where : {
+					id : appointment.schedule.id
+				},
+				data : {
+					availableSlots : newAvailableSlots
+				}
+			})
 
 			await tx.payment.update({
 				where: {
@@ -202,6 +366,62 @@ const bookAppointmentCallback = async (query: Record<string, any>) => {
 					gatewayResponse: executedPaymentResult,
 				},
 			});
+
+			const pdfDocument = new PDFDocument({ margin : 50});
+
+			const pdfChunks : Buffer[] = []
+
+			pdfDocument.on("data", (chunk : Buffer) => {
+				pdfChunks.push(chunk)
+			})
+
+			const pdfReadyPromise = new Promise<Buffer>((resolve)=>{
+				pdfDocument.on("end", () => {
+					resolve(Buffer.concat(pdfChunks))
+				})
+			})
+
+			pdfDocument.fontSize(20).text("PH Healthcare System", {align : "center"});
+			pdfDocument.fontSize(14).text("Appointment Invoice", { align: "center" });
+			pdfDocument.moveDown(2)
+
+			pdfDocument.fontSize(12).text(`Patient Name: ${appointment.patient?.name}`);
+			pdfDocument.text(`Patient Email: ${appointment.patient?.email}`);
+			pdfDocument.moveDown();
+
+			pdfDocument.text(`Doctor Name: ${appointment.doctor?.name}`);
+			pdfDocument.text(`Specialization: ${appointment.doctor?.specialization}`);
+			pdfDocument.moveDown();
+
+			pdfDocument.text(
+				`Appointment Date: ${appointment.schedule.startDateTime.toDateString()}`,
+			);
+			pdfDocument.text(`Your Joining Time: ${joiningTime.toString()}`);
+			pdfDocument.text(`Your Serial Number: ${serialNumber}`);
+			pdfDocument.text(`Meeting Link: ${appointment.schedule.meetingLink}`);
+			pdfDocument.moveDown();
+
+			pdfDocument.text(`Amount Paid: ${executedPaymentResult.amount} BDT`);
+			pdfDocument.text(`Payment Method: bKash`);
+			pdfDocument.text(`Transaction Id: ${executedPaymentResult.trxID}`);
+			pdfDocument.text(`Paid At: ${executedPaymentResult.paymentExecuteTime}`);
+
+			pdfDocument.end()
+
+			const pdfBuffer = await pdfReadyPromise;
+
+			await transporter.sendMail({
+				from: config.email_sender,
+				to: appointment.patient.email,
+				subject: "Your Appointment Invoice - PH Healthcare System",
+				text: "Thank you for booking an appointment. Please find your invoice attached.",
+				attachments : [
+					{
+						filename: "invoice.pdf",
+						content : pdfBuffer
+					}
+				]
+			})
 
 			return {
 				redirectUrl: `${config.frontend_url}/dashboard/my-appointments?status=success`,
@@ -239,6 +459,9 @@ const bookAppointmentCallback = async (query: Record<string, any>) => {
 				redirectUrl: `${config.frontend_url}/dashboard/my-appointments?error=payment-failed`,
 			};
 		}
+	}, {
+		maxWait: 10000, // default: 2000
+		timeout: 30000, // default: 5000
 	});
 
 	return transactionResult;
