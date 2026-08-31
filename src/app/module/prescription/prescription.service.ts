@@ -128,6 +128,7 @@ const createPrescription = async (payload : ICreatePrescriptionPayload, user : R
             prescriptionPublicId: uploadResult.public_id,
         },
     });
+    
 
     await transporter.sendMail({
         from: config.email_sender,
