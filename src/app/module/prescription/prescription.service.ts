@@ -129,7 +129,6 @@ const createPrescription = async (payload : ICreatePrescriptionPayload, user : R
         },
     });
     
-
     await transporter.sendMail({
         from: config.email_sender,
         to: appointment.patient.email,
