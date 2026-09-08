@@ -156,6 +156,7 @@ export const seedTesterDoctor = async () => {
                 }
             }
         })
+        
 
         console.log("Tester Doctor Created : ",testerDoctor);
 
