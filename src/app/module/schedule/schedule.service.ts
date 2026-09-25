@@ -290,7 +290,7 @@ const updateSchedule = async (scheduleId : string, payload : IUpdateSchedulePayl
     }
 
     if(schedule.status === ScheduleStatus.PUBLISHED && schedule.totalSlots !== schedule.availableSlots){
-        throw new AppError(httpStatus.CONFLICT, "Schedule Once Published And Appointment Booked Cannot Be Updated");
+        throw new AppError(httpStatus.CONFLICT, "Schedule Once Published And Appoinemtn Booked Cannot Be Updated");
     }
 
     // if (schedule.doctorId !== doctor.id) {
@@ -483,8 +483,8 @@ const getTodaysSchedules = async (query : IQuery) => {
             startDateTime : {
                 gte : startOfToday,
                 lt : startOfTomorrow,
-                gt: now
-            }
+            },
+            endDateTime : { gt : now }
         },
         {
             availableSlots : { gt : 0}
