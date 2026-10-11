@@ -44,6 +44,7 @@ const applyAsDoctor = async (
       "User Already Exists With This Email",
     );
   }
+  
 
   const resumeUploadResult = await new Promise<UploadApiResponse>(
     (resolve, reject) => {
